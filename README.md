@@ -17,10 +17,6 @@ A compact Python project for pricing European options, computing simple Greeks, 
 - Volatility sensitivity plots
 - Terminal price distribution plots
 
-## Why this project exists
-
-This is meant to be a clean, interview-friendly quant project: small enough to read quickly, but broad enough to show modelling, simulation, numerical methods, and clear implementation.
-
 ## Repository layout
 
 ```text
@@ -110,9 +106,3 @@ You can then embed them like this:
 - Delta hedging PnL simulation
 - Local volatility or stochastic volatility models
 - Historical backtesting of delta hedging
-
-## What to say about it in an interview
-
-A good short description is:
-
-> I built a small Python toolkit for pricing European options with Black-Scholes, Bachelier, and Monte Carlo methods. I added finite-difference Greeks, implied volatility by bisection, and a couple of plots to compare models and inspect simulation output. The project was mainly a way to turn basic derivatives theory into a clean, testable piece of code.
