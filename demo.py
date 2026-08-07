@@ -1,28 +1,20 @@
-# demo.py
-#
-# End-to-end demonstration of the options_pricing_toolkit.
-#
-# Workflow:
-#   1. Define a standard ATM European call option.
-#   2. Price it with Black-Scholes, Bachelier, and Monte Carlo.
-#   3. Compute Black-Scholes Greeks via finite differences.
-#   4. Recover implied volatility from the Black-Scholes price.
-#   5. Generate and save two diagnostic plots to the docs/ directory.
-
 from pathlib import Path
 import sys
 
-# ---------------------------------------------------------------------------
-# Path setup — allows the script to be run from any working directory
-# without installing the package.  Adds the project's src/ folder to the
-# module search path so that `import options_pricing_toolkit` resolves
-# correctly regardless of where Python is invoked from.
-# ---------------------------------------------------------------------------
-ROOT = Path(__file__).resolve().parents[1]   # Project root (two levels above this file)
-sys.path.append(str(ROOT / "src"))           # Expose src/ to the Python import system
+# __file__ is the absolute path to this script.
+# .resolve() canonicalises it (resolves symlinks, makes it absolute).
+# .parents[1] walks two levels up — from the script's folder to the project root.
+ROOT = Path(__file__).resolve().parents[1]
+
+# Add the project's src/ directory to Python's module search path at runtime.
+# This lets us import options_pricing_toolkit without installing the package,
+# which is handy during development when you're running scripts directly.
+sys.path.append(str(ROOT / "src"))
 
 import numpy as np
 
+# Import everything we need from the toolkit — explicit imports make it clear
+# exactly which parts of the module this demo depends on.
 from options_pricing_toolkit import (
     OptionSpec,
     bachelier_price,
@@ -35,90 +27,70 @@ from options_pricing_toolkit import (
 )
 
 
-# ---------------------------------------------------------------------------
-# Output directory
-# ---------------------------------------------------------------------------
-
-# Create docs/ at the project root if it does not already exist.
-# All generated plot images will be saved here.
+# Create the docs/ directory if it doesn't already exist.
+# exist_ok=True means no error is raised if the folder is already there.
 docs_dir = ROOT / "docs"
 docs_dir.mkdir(exist_ok=True)
 
-
-# ---------------------------------------------------------------------------
-# Option specification
-# ---------------------------------------------------------------------------
-
-# Standard at-the-money (ATM) European call:
-#   Spot = Strike = 100, 1-year maturity, 5% risk-free rate, 20% vol
+# Define a single at-the-money call option that all the demo calculations will use.
+# Spot == Strike means the option is exactly at-the-money.
 spec = OptionSpec(
     spot=100.0,
     strike=100.0,
-    maturity=1.0,
-    rate=0.05,
-    volatility=0.2,
+    maturity=1.0,    # 1 year
+    rate=0.05,       # 5% risk-free rate
+    volatility=0.2,  # 20% vol
     option_type="call",
 )
 
+# --- Compute All Prices and Greeks Up Front ---
+# We run every calculation first and store the results, then print them together.
+# This keeps the output section clean and makes it easy to add more calculations later.
 
-# ---------------------------------------------------------------------------
-# Pricing
-# ---------------------------------------------------------------------------
+bs   = black_scholes_price(spec)
+bach = bachelier_price(spec)
+mc, se = monte_carlo_price(spec, n_paths=100_000, seed=7)  # se = standard error
+greeks = compute_greeks(spec)
 
-bs   = black_scholes_price(spec)                       # Analytical BSM price
-bach = bachelier_price(spec)                           # Analytical Bachelier price
-mc, se = monte_carlo_price(spec, n_paths=100_000, seed=7)  # MC price + standard error
+# Round-trip implied vol: pass the BS price back into the IV solver.
+# The result should be very close to 0.20 (our input vol), confirming consistency.
+iv = implied_volatility_from_price(bs, spec)
 
-
-# ---------------------------------------------------------------------------
-# Greeks and implied volatility
-# ---------------------------------------------------------------------------
-
-greeks = compute_greeks(spec)                 # Delta, Vega, Rho, Theta via finite differences
-iv     = implied_volatility_from_price(bs, spec)  # Recover σ from the BSM price (should ≈ 0.20)
-
-
-# ---------------------------------------------------------------------------
-# Console output
-# ---------------------------------------------------------------------------
-
+# --- Print Results ---
 print(f"Black-Scholes call price: {bs:.4f}")
-print(f"Bachelier call price:     {bach:.4f}")
-print(f"Monte Carlo call price:   {mc:.4f} ± {se:.4f}")   # ± one standard error
-
+print(f"Bachelier call price: {bach:.4f}")
+print(f"Monte Carlo call price: {mc:.4f} ± {se:.4f}")  # ± shows the sampling uncertainty
 print("Greeks:")
 for name, value in greeks.items():
-    print(f"  {name}: {value:.4f}")
+    print(f"  {name}: {value:.4f}")   # Two-space indent to visually group them under the header
+print(f"Implied volatility from BS price: {iv:.4f}")
 
-print(f"Implied volatility from BS price: {iv:.4f}")       # Round-trip check; expect 0.2000
+# --- Volatility Grids for Sensitivity Plots ---
 
+# 40 evenly-spaced lognormal vol values from 5% to 60% for the Black-Scholes panel.
+# This range covers everything from low-vol blue-chip stocks to high-vol small caps.
+bs_vol_grid = np.linspace(0.05, 0.60, 40)
 
-# ---------------------------------------------------------------------------
-# Volatility sensitivity plot
-# ---------------------------------------------------------------------------
+# 40 evenly-spaced normal vol values from 1 to 30 for the Bachelier panel.
+# Bachelier vol is denominated in the same units as the price (e.g. dollars),
+# so the scale is completely different from the lognormal vol above.
+bach_vol_grid = np.linspace(1.0, 30.0, 40)
 
-# Two separate vol grids because the models use different vol conventions:
-#   Black-Scholes uses lognormal vol (dimensionless, e.g. 0.05–0.60)
-#   Bachelier uses normal vol (same units as the asset price, e.g. 1–30)
-bs_vol_grid   = np.linspace(0.05, 0.60, 40)   # 40 lognormal vol levels from 5% to 60%
-bach_vol_grid = np.linspace(1.0,  30.0, 40)   # 40 normal vol levels from 1 to 30
+# --- Generate and Save Plots ---
 
+# Plot how each model's price changes as volatility increases.
+# Passing save_path writes the figure to disk; show=True also opens it interactively.
 plot_volatility_sensitivity(
     spec,
     bs_vol_grid,
     bach_vol_grid,
     save_path=str(docs_dir / "volatility_sensitivity.png"),
-    show=True,   # Display interactively; also saved to disk
+    show=True,
 )
 
-
-# ---------------------------------------------------------------------------
-# Terminal price distribution plot
-# ---------------------------------------------------------------------------
-
-# Simulate 30k GBM paths and plot the resulting lognormal distribution.
-# The strike is overlaid as a dashed red line so the in-the-money region
-# is immediately visible.
+# Plot the histogram of simulated terminal prices from the GBM model.
+# Using 30,000 paths here (vs 100,000 for pricing) — fewer paths is fine for
+# a visual distribution check where we don't need high numerical precision.
 plot_terminal_distribution(
     spec,
     n_paths=30_000,
@@ -126,11 +98,7 @@ plot_terminal_distribution(
     show=True,
 )
 
-
-# ---------------------------------------------------------------------------
-# Confirm saved output paths
-# ---------------------------------------------------------------------------
-
+# Confirm where the output files landed so the user can find them easily.
 print("Saved plots:")
 print(f"  {docs_dir / 'volatility_sensitivity.png'}")
 print(f"  {docs_dir / 'terminal_distribution.png'}")
