@@ -1,99 +1,55 @@
-# options_pricing_toolkit.py
-#
-# A self-contained toolkit for pricing European options using three models:
-#   - Black-Scholes (lognormal, analytical)
-#   - Bachelier     (normal, analytical)
-#   - Monte Carlo   (GBM simulation, numerical)
-#
-# Also provides:
-#   - Finite-difference Greek estimation
-#   - Implied-volatility solver (bisection)
-#   - Matplotlib visualisation helpers
-
-from __future__ import annotations  # Enables postponed evaluation of type hints (PEP 563)
+# Allow 'OptionSpec | None' style type hints in Python versions before 3.10
+from __future__ import annotations
 
 import math
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Callable
+from dataclasses import dataclass   # Gives us a clean way to define plain data-holding classes
+from pathlib import Path             # Cross-platform file path handling
+from typing import Callable          # Used to type-hint functions passed as arguments
 
 import matplotlib.pyplot as plt
 import numpy as np
 
 
-# ---------------------------------------------------------------------------
-# Mathematical helpers
-# ---------------------------------------------------------------------------
+# --- Probability Helpers ---
+# These two functions implement the standard normal PDF and CDF manually.
+# The Black-Scholes and Bachelier formulas both require evaluating these,
+# so rather than pulling in scipy we define them using Python's built-in math module.
 
 def normal_pdf(x: float) -> float:
-    """
-    Standard normal probability density function (PDF).
-
-    Computes:
-        φ(x) = exp(-x² / 2) / √(2π)
-
-    Used in the Bachelier pricing formula where the PDF of the standard
-    normal distribution appears directly in the analytical solution.
-    """
+    # The standard normal probability density function: (1 / sqrt(2π)) * e^(-x²/2)
+    # Used in the Bachelier formula to compute the "density at the boundary" term.
     return math.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
 
 
 def normal_cdf(x: float) -> float:
-    """
-    Standard normal cumulative distribution function (CDF).
-
-    Computes:
-        Φ(x) = 0.5 * (1 + erf(x / √2))
-
-    Delegates to math.erf, which is accurate to machine precision.
-    Used in both the Black-Scholes and Bachelier closed-form formulas.
-    """
+    # The standard normal cumulative distribution function.
+    # math.erf is the error function; this identity converts it to the CDF exactly.
+    # Used extensively in both Black-Scholes and Bachelier pricing.
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 
-# ---------------------------------------------------------------------------
-# Option specification
-# ---------------------------------------------------------------------------
+# --- Option Specification ---
 
 @dataclass
 class OptionSpec:
-    """
-    Immutable-by-convention container for all parameters that define a
-    single European option contract.
-
-    Attributes
-    ----------
-    spot       : Current price of the underlying asset (S₀).
-    strike     : Strike / exercise price of the option (K).
-    maturity   : Time to expiry in years (T).
-    rate       : Continuously compounded risk-free interest rate (r).
-    volatility : Annualised volatility of the underlying (σ).
-                 Interpreted as *lognormal* vol for Black-Scholes and
-                 *normal* vol for Bachelier.
-    option_type: 'call' (right to buy) or 'put' (right to sell).
-    """
-
-    spot: float
-    strike: float
-    maturity: float
-    rate: float
-    volatility: float
-    option_type: str = "call"
+    # A dataclass is essentially a struct — Python auto-generates __init__, __repr__,
+    # and __eq__ for us based on the fields declared below.
+    spot: float        # Current price of the underlying asset (S)
+    strike: float      # The price at which the option can be exercised (K)
+    maturity: float    # Time to expiry in years (T)
+    rate: float        # Continuously compounded risk-free interest rate (r)
+    volatility: float  # Annualised volatility of the underlying (σ)
+    option_type: str = "call"  # Either "call" or "put"; defaults to call
 
     def validate(self) -> None:
-        """
-        Raise ValueError for any parameter combination that would produce
-        undefined or economically meaningless results.
-
-        Called at the start of every pricing function so that errors are
-        caught early with a clear message rather than producing a silent
-        NaN or an obscure math-domain error deep in the calculation.
-        """
+        # Every pricer calls this before doing any math, so bad inputs are caught
+        # early with a clear message rather than producing a silent wrong answer.
         if self.spot <= 0:
             raise ValueError("spot must be positive")
         if self.strike <= 0:
             raise ValueError("strike must be positive")
         if self.maturity < 0:
+            # Maturity of exactly zero is allowed — it means the option has just expired.
             raise ValueError("maturity must be non-negative")
         if self.volatility < 0:
             raise ValueError("volatility must be non-negative")
@@ -101,104 +57,54 @@ class OptionSpec:
             raise ValueError("option_type must be 'call' or 'put'")
 
 
-# ---------------------------------------------------------------------------
-# Analytical pricers
-# ---------------------------------------------------------------------------
+# --- Black-Scholes Pricer ---
 
 def black_scholes_price(spec: OptionSpec) -> float:
-    """
-    Price a European option under the Black-Scholes-Merton (BSM) model.
-
-    The BSM model assumes the underlying follows Geometric Brownian Motion
-    (GBM), so the terminal price is lognormally distributed.
-
-    Closed-form prices:
-        Call: C = S·Φ(d₁) − K·e^(−rT)·Φ(d₂)
-        Put:  P = K·e^(−rT)·Φ(−d₂) − S·Φ(−d₁)
-
-    where:
-        d₁ = [ln(S/K) + (r + σ²/2)·T] / (σ√T)
-        d₂ = d₁ − σ√T
-
-    Edge cases handled explicitly:
-        - T = 0  → immediate exercise value (intrinsic value).
-        - σ = 0  → deterministic forward; price is discounted intrinsic.
-
-    Parameters
-    ----------
-    spec : OptionSpec
-        Fully populated option specification.
-
-    Returns
-    -------
-    float
-        Fair value of the option in the same currency as spot/strike.
-    """
     spec.validate()
 
-    # Unpack for readability
+    # Unpack fields into short local names to keep the formula lines readable
     S = spec.spot
     K = spec.strike
     T = spec.maturity
     r = spec.rate
     sigma = spec.volatility
 
-    # --- Edge case: option has already expired ---
-    # At expiry the option is worth its intrinsic value only.
+    # At expiry the option is worth exactly its intrinsic value — no time value remains.
+    # Handling this edge case avoids a division-by-zero in the d1/d2 calculation below.
     if T == 0:
         if spec.option_type == "call":
             return max(S - K, 0.0)
         return max(K - S, 0.0)
 
-    # --- Edge case: zero volatility ---
-    # With no randomness the asset grows deterministically at rate r,
-    # so the forward price is S·e^(rT) and we discount back to today.
+    # With zero volatility the asset price is deterministic, so we only need to check
+    # whether the discounted forward price beats the strike — no optionality premium.
     if sigma == 0:
         forward_intrinsic = S - K * math.exp(-r * T)
         if spec.option_type == "call":
             return max(forward_intrinsic, 0.0)
         return max(-forward_intrinsic, 0.0)
 
-    # --- Standard BSM formula ---
+    # Core Black-Scholes d1 and d2 terms.
+    # d1 captures how far in-the-money the option is, adjusted for drift and vol.
+    # d2 = d1 - σ√T is the risk-neutral probability of finishing in-the-money.
     d1 = (math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * math.sqrt(T))
     d2 = d1 - sigma * math.sqrt(T)
 
+    # Standard Black-Scholes closed-form prices.
+    # For a call:  S·N(d1) − K·e^(−rT)·N(d2)
+    # For a put:   K·e^(−rT)·N(−d2) − S·N(−d1)
+    # N(−x) = 1 − N(x), so we just negate the argument rather than subtracting.
     if spec.option_type == "call":
         return S * normal_cdf(d1) - K * math.exp(-r * T) * normal_cdf(d2)
-    # Put price derived from the same formula via put-call symmetry
     return K * math.exp(-r * T) * normal_cdf(-d2) - S * normal_cdf(-d1)
 
 
+# --- Bachelier Pricer ---
+# The Bachelier model assumes the underlying follows arithmetic (normal) Brownian motion
+# rather than geometric Brownian motion. This means prices can go negative, which makes
+# it more appropriate for interest rates or spreads than for equity prices.
+
 def bachelier_price(spec: OptionSpec) -> float:
-    """
-    Price a European option under the Bachelier (normal) model.
-
-    Unlike Black-Scholes, Bachelier assumes the *absolute* change in the
-    underlying is normally distributed, making it suitable for assets that
-    can go negative (e.g. interest rates, spreads).
-
-    Closed-form prices (in terms of the forward F = S·e^(rT)):
-        Call: C = e^(−rT) · [(F−K)·Φ(d) + σ√T·φ(d)]
-        Put:  P = C − e^(−rT)·(F−K)          ← via put-call parity
-
-    where:
-        d = (F − K) / (σ√T)
-
-    Edge cases handled:
-        - T = 0  → intrinsic value.
-        - σ√T = 0 → deterministic forward; discounted intrinsic.
-
-    Parameters
-    ----------
-    spec : OptionSpec
-        Fully populated option specification.
-        `volatility` is interpreted as the *normal* (absolute) volatility.
-
-    Returns
-    -------
-    float
-        Fair value of the option.
-    """
     spec.validate()
 
     S = spec.spot
@@ -207,32 +113,38 @@ def bachelier_price(spec: OptionSpec) -> float:
     r = spec.rate
     sigma = spec.volatility
 
-    # --- Edge case: option has already expired ---
+    # Same expiry edge case as Black-Scholes — return intrinsic value immediately.
     if T == 0:
         if spec.option_type == "call":
             return max(S - K, 0.0)
         return max(K - S, 0.0)
 
-    discount = math.exp(-r * T)          # Present-value discount factor e^(−rT)
-    forward  = S * math.exp(r * T)       # Risk-neutral forward price F = S·e^(rT)
-    stdev    = sigma * math.sqrt(T)      # Standard deviation of the terminal price distribution
+    discount = math.exp(-r * T)          # Present-value factor e^(−rT)
+    forward = S * math.exp(r * T)        # Risk-neutral forward price F = S·e^(rT)
+    stdev = sigma * math.sqrt(T)         # Total normal vol over the life of the option
 
-    # --- Edge case: zero vol or zero time → deterministic outcome ---
     if stdev == 0:
+        # No randomness means the payoff is fully determined by the forward vs strike.
         call = discount * max(forward - K, 0.0)
     else:
-        d    = (forward - K) / stdev                                          # Standardised moneyness
+        # d here plays the same conceptual role as d2 in Black-Scholes:
+        # it measures how many standard deviations the forward is above the strike.
+        d = (forward - K) / stdev
+
+        # Bachelier call formula:  e^(−rT) · [(F−K)·N(d) + σ√T·n(d)]
+        # The first term is the expected in-the-money payoff; the second is the
+        # "edge" contribution from the probability density right at the strike.
         call = discount * ((forward - K) * normal_cdf(d) + stdev * normal_pdf(d))
 
     if spec.option_type == "call":
         return call
-    # Bachelier put-call parity: P = C − discount·(F − K)
+
+    # Put price via put-call parity in the Bachelier world:
+    # Put = Call − e^(−rT)·(F − K)
     return call - discount * (forward - K)
 
 
-# ---------------------------------------------------------------------------
-# Monte Carlo simulation
-# ---------------------------------------------------------------------------
+# --- Monte Carlo Engine ---
 
 def simulate_terminal_prices_gbm(
     spot: float,
@@ -240,38 +152,22 @@ def simulate_terminal_prices_gbm(
     rate: float,
     volatility: float,
     n_paths: int,
-    seed: int | None = 42,
+    seed: int | None = 42,   # Fixed seed by default so results are reproducible
 ) -> np.ndarray:
-    """
-    Simulate terminal asset prices under Geometric Brownian Motion (GBM).
+    # Build a seeded random number generator — preferred over np.random.seed()
+    # because it is stateless and won't interfere with other RNG usage in the program.
+    rng = np.random.default_rng(seed)
 
-    Under GBM the exact solution for the terminal price is:
-        S_T = S₀ · exp[(r − σ²/2)·T + σ·√T·Z]
+    # Draw n_paths independent standard-normal samples — one per simulated path.
+    z = rng.standard_normal(n_paths)
 
-    where Z ~ N(0,1). This avoids time-stepping discretisation error
-    entirely because the log-price is normally distributed.
+    # Under GBM the log-return over [0, T] is normally distributed:
+    #   ln(S_T / S_0) ~ N((r − σ²/2)·T,  σ²·T)
+    # We split this into a deterministic drift and a stochastic diffusion term.
+    drift = (rate - 0.5 * volatility * volatility) * maturity
+    diffusion = volatility * math.sqrt(maturity) * z
 
-    Parameters
-    ----------
-    spot       : Initial asset price S₀.
-    maturity   : Time horizon T (years).
-    rate       : Continuously compounded risk-free rate r.
-    volatility : Lognormal volatility σ.
-    n_paths    : Number of independent simulation paths.
-    seed       : RNG seed for reproducibility; pass None for a random seed.
-
-    Returns
-    -------
-    np.ndarray of shape (n_paths,)
-        Simulated terminal prices S_T for each path.
-    """
-    rng = np.random.default_rng(seed)          # Reproducible random number generator
-    z   = rng.standard_normal(n_paths)         # Draw n_paths standard normal samples
-
-    # Decompose the log-return into its deterministic drift and stochastic diffusion
-    drift     = (rate - 0.5 * volatility * volatility) * maturity   # (r − σ²/2)·T
-    diffusion = volatility * math.sqrt(maturity) * z                # σ·√T·Z
-
+    # Exponentiate to recover the terminal asset price for each path.
     return spot * np.exp(drift + diffusion)
 
 
@@ -279,41 +175,18 @@ def monte_carlo_price(
     spec: OptionSpec,
     n_paths: int = 100_000,
     seed: int | None = 42,
-) -> tuple[float, float]:
-    """
-    Price a European option via Monte Carlo simulation under GBM.
-
-    Procedure:
-        1. Simulate n_paths terminal prices using simulate_terminal_prices_gbm.
-        2. Compute the option payoff on each path.
-        3. Discount payoffs back to today and average them.
-
-    The standard error of the mean is also returned as a measure of
-    simulation uncertainty; it shrinks as O(1/√n_paths).
-
-    Parameters
-    ----------
-    spec    : OptionSpec  — option parameters.
-    n_paths : int         — number of Monte Carlo paths (more → lower error).
-    seed    : int | None  — RNG seed for reproducibility.
-
-    Returns
-    -------
-    (price, stderr) : tuple[float, float]
-        price  — Monte Carlo estimate of the option fair value.
-        stderr — Standard error of the Monte Carlo estimate.
-    """
+) -> tuple[float, float]:   # Returns (price estimate, standard error)
     spec.validate()
 
-    # --- Edge case: expired option → return deterministic intrinsic value ---
+    # Expired option — no simulation needed, payoff is deterministic.
     if spec.maturity == 0:
         if spec.option_type == "call":
             payoff = max(spec.spot - spec.strike, 0.0)
         else:
             payoff = max(spec.strike - spec.spot, 0.0)
-        return payoff, 0.0   # Zero standard error: no randomness at expiry
+        return payoff, 0.0   # Standard error is zero because there is no randomness
 
-    # Step 1 — Simulate terminal prices
+    # Simulate where the asset price ends up at maturity across all paths.
     terminal = simulate_terminal_prices_gbm(
         spec.spot,
         spec.maturity,
@@ -323,151 +196,91 @@ def monte_carlo_price(
         seed,
     )
 
-    # Step 2 — Compute per-path payoffs
-    # Call payoff: max(S_T − K, 0);  Put payoff: max(K − S_T, 0)
+    # Compute the payoff on each path. np.maximum is the vectorised version of max(),
+    # operating element-wise across the entire array in one shot.
     if spec.option_type == "call":
         payoffs = np.maximum(terminal - spec.strike, 0.0)
     else:
         payoffs = np.maximum(spec.strike - terminal, 0.0)
 
-    # Step 3 — Discount to present value and compute the mean (the MC price)
+    # Discount each payoff back to today and average across paths.
+    # By the law of large numbers this converges to the true risk-neutral expectation.
     discounted = np.exp(-spec.rate * spec.maturity) * payoffs
+    price = float(np.mean(discounted))
 
-    price  = float(np.mean(discounted))
-    # Standard error = sample std dev / √n  (ddof=1 for unbiased std dev)
+    # Standard error of the mean = sample std dev / sqrt(n).
+    # ddof=1 applies Bessel's correction, giving an unbiased variance estimate.
+    # This tells us how uncertain our price estimate is due to sampling noise.
     stderr = float(np.std(discounted, ddof=1) / math.sqrt(n_paths))
 
     return price, stderr
 
 
-# ---------------------------------------------------------------------------
-# Greeks via finite differences
-# ---------------------------------------------------------------------------
+# --- Numerical Greeks via Finite Differences ---
 
 def finite_difference_greek(
-    pricer: Callable[[OptionSpec], float],
+    pricer: Callable[[OptionSpec], float],  # Any pricing function that accepts an OptionSpec
     spec: OptionSpec,
-    parameter: str,
-    bump: float,
+    parameter: str,   # The name of the OptionSpec field we want to bump, e.g. "spot"
+    bump: float,      # The size of the perturbation h
 ) -> float:
-    """
-    Estimate a first-order option Greek using a central finite difference.
-
-    The central difference approximation is:
-        ∂V/∂θ ≈ [V(θ + h) − V(θ − h)] / (2h)
-
-    Central differences are second-order accurate — the error is O(h²) —
-    which is significantly better than the O(h) error of one-sided schemes.
-
-    Parameters
-    ----------
-    pricer    : Any function that accepts an OptionSpec and returns a price.
-                This allows the same helper to be used with any model.
-    spec      : Base OptionSpec from which bumped copies are derived.
-    parameter : Name of the OptionSpec attribute to bump (e.g. 'spot').
-    bump      : Half-width of the finite-difference interval h.
-                Must be positive; a typical value is 1 % of the parameter.
-
-    Returns
-    -------
-    float
-        Numerical approximation of ∂V/∂parameter.
-    """
     if bump <= 0:
         raise ValueError("bump must be positive")
 
-    # Create independent copies so the original spec is never mutated
-    up   = OptionSpec(**vars(spec))
+    # Create two independent copies of the spec so we can bump each direction
+    # without mutating the original. vars() returns the dataclass fields as a dict.
+    up = OptionSpec(**vars(spec))
     down = OptionSpec(**vars(spec))
 
-    # Apply the symmetric bump; clamp the downward bump to a small positive
-    # floor (1e-8) to prevent non-positive spot/strike/vol/maturity values
-    setattr(up,   parameter, getattr(up,   parameter) + bump)
+    # Apply +h and −h bumps to the chosen parameter using Python's reflection API.
+    # The max(..., 1e-8) on the downward bump prevents parameters like volatility
+    # from going negative, which would fail validation.
+    setattr(up, parameter, getattr(up, parameter) + bump)
     setattr(down, parameter, max(getattr(down, parameter) - bump, 1e-8))
 
+    # Central difference: (f(x+h) − f(x−h)) / 2h
+    # This is second-order accurate — the error shrinks as h², not just h.
     return (pricer(up) - pricer(down)) / (2.0 * bump)
 
 
 def compute_greeks(spec: OptionSpec) -> dict[str, float]:
-    """
-    Compute the four primary Black-Scholes Greeks via finite differences.
-
-    Greek definitions and the parameter bumped for each:
-        Delta (Δ) — ∂V/∂S        : sensitivity to the underlying price.
-        Vega  (ν) — ∂V/∂σ        : sensitivity to volatility.
-        Rho   (ρ) — ∂V/∂r        : sensitivity to the risk-free rate.
-        Theta (Θ) — −∂V/∂T       : time decay (negative sign because as
-                                    calendar time advances, T decreases).
-
-    All Greeks are computed using the Black-Scholes pricer.
-
-    Parameters
-    ----------
-    spec : OptionSpec — option parameters.
-
-    Returns
-    -------
-    dict[str, float]
-        Keys: 'delta', 'vega', 'rho', 'theta'.
-    """
+    # All four Greeks are computed via finite differences against the Black-Scholes pricer.
     return {
-        # Bump spot by 1 cent (0.01) — small relative to typical spot prices
-        "delta": finite_difference_greek(black_scholes_price, spec, "spot",       1e-2),
-        # Bump vol by 0.01 % (0.0001) — small relative to typical vol levels
-        "vega":  finite_difference_greek(black_scholes_price, spec, "volatility", 1e-4),
-        # Bump rate by 0.01 % (0.0001 in decimal)
-        "rho":   finite_difference_greek(black_scholes_price, spec, "rate",       1e-4),
-        # Theta: negate because we bump maturity (increasing T) but theta
-        # conventionally measures value lost as time *passes* (T decreases)
-        "theta": -finite_difference_greek(black_scholes_price, spec, "maturity",  1e-4),
+        # Delta: sensitivity of price to a $1 move in the spot price
+        "delta": finite_difference_greek(black_scholes_price, spec, "spot", 1e-2),
+
+        # Vega: sensitivity of price to a 0.01 (1%) move in volatility
+        "vega": finite_difference_greek(black_scholes_price, spec, "volatility", 1e-4),
+
+        # Rho: sensitivity of price to a 0.01 (1%) move in the risk-free rate
+        "rho": finite_difference_greek(black_scholes_price, spec, "rate", 1e-4),
+
+        # Theta: rate of price decay per unit of time. The finite difference gives
+        # dPrice/dT (which is positive for long options), so we negate it to get
+        # the conventional theta sign — the daily cost of holding the option.
+        "theta": -finite_difference_greek(black_scholes_price, spec, "maturity", 1e-4),
     }
 
 
-# ---------------------------------------------------------------------------
-# Implied volatility solver
-# ---------------------------------------------------------------------------
+# --- Implied Volatility via Bisection ---
 
 def implied_volatility_from_price(
     market_price: float,
     base_spec: OptionSpec,
-    tol: float = 1e-8,
-    max_iter: int = 200,
+    tol: float = 1e-8,    # Stop when the model price is within this distance of market_price
+    max_iter: int = 200,  # Safety cap — bisection converges fast so 200 is very generous
 ) -> float:
-    """
-    Recover the implied volatility (IV) consistent with an observed market
-    price using the Black-Scholes model and bisection search.
-
-    Implied volatility is the value of σ that satisfies:
-        BSM_price(σ) = market_price
-
-    Bisection is chosen for its guaranteed convergence on a monotone
-    function — BSM price is strictly increasing in σ — at the cost of
-    being slower than Newton-Raphson. With max_iter=200 the interval
-    [1e-8, 5.0] is narrowed to a width of ~5 / 2^200 ≈ 0, far below
-    the default tolerance.
-
-    Parameters
-    ----------
-    market_price : Observed option price to invert.
-    base_spec    : OptionSpec with all parameters except volatility fixed.
-                   The volatility field is ignored; it is solved for.
-    tol          : Convergence tolerance on the price residual.
-    max_iter     : Maximum number of bisection iterations.
-
-    Returns
-    -------
-    float
-        Implied volatility σ such that BSM_price(σ) ≈ market_price.
-    """
-    # Search bounds: [near-zero vol, 500% vol]
-    # BSM price is monotonically increasing in σ, so bisection is valid
-    low  = 1e-8
+    # Search bounds for volatility. 1e-8 is effectively zero; 5.0 is 500% vol,
+    # which is extreme enough to bracket any realistic market price.
+    low = 1e-8
     high = 5.0
 
     for _ in range(max_iter):
-        mid = 0.5 * (low + high)   # Candidate volatility (midpoint of current interval)
+        # Test the midpoint of the current bracket
+        mid = 0.5 * (low + high)
 
-        # Evaluate BSM price at the candidate volatility
+        # Build a fresh spec with the candidate volatility — we can't mutate base_spec
+        # because the caller may still need it after this function returns.
         spec = OptionSpec(
             spot=base_spec.spot,
             strike=base_spec.strike,
@@ -478,81 +291,49 @@ def implied_volatility_from_price(
         )
         price = black_scholes_price(spec)
 
-        # Check convergence: stop if the price residual is within tolerance
+        # Convergence check — if we're close enough, return immediately
         if abs(price - market_price) < tol:
             return mid
 
-        # Narrow the search interval based on whether the model price is
-        # too low (need higher vol) or too high (need lower vol)
+        # Black-Scholes price is monotonically increasing in volatility, so:
+        # if the model underprices, the true vol must be higher → raise the lower bound
+        # if the model overprices, the true vol must be lower  → lower the upper bound
         if price < market_price:
             low = mid
         else:
             high = mid
 
-    # Return the best midpoint estimate if max iterations are exhausted
+    # If we exhaust all iterations without converging, return the best midpoint we have.
     return 0.5 * (low + high)
 
 
-# ---------------------------------------------------------------------------
-# Plotting helpers
-# ---------------------------------------------------------------------------
+# --- Plotting Utilities ---
 
 def _finalize_plot(save_path: str | None = None, show: bool = True) -> None:
-    """
-    Apply final layout adjustments and either save and/or display the
-    current Matplotlib figure, then clean up.
-
-    Separating this logic avoids duplicating the same save/show/close
-    boilerplate in every individual plotting function.
-
-    Parameters
-    ----------
-    save_path : File path to save the figure to (PNG, PDF, etc.).
-                Parent directories are created automatically if needed.
-                Pass None to skip saving.
-    show      : If True, display the figure interactively via plt.show().
-                If False, close the figure silently (useful in batch runs
-                or automated testing where no display is available).
-    """
-    plt.tight_layout()   # Adjust subplot spacing to prevent label overlap
+    # Tighten subplot spacing so labels and titles don't overlap
+    plt.tight_layout()
 
     if save_path is not None:
         output = Path(save_path)
-        output.parent.mkdir(parents=True, exist_ok=True)   # Ensure output directory exists
-        plt.savefig(output, dpi=160)                        # Save at 160 DPI for crisp output
+        # Create any missing parent directories automatically (like 'mkdir -p')
+        output.parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(output, dpi=160)   # 160 dpi gives a crisp image without huge file size
 
     if show:
-        plt.show()
+        plt.show()   # Opens the interactive window
     else:
-        plt.close()   # Release memory when not displaying interactively
+        plt.close()  # Free memory without displaying — useful in automated/headless runs
 
 
 def plot_volatility_sensitivity(
     spec: OptionSpec,
-    bs_vol_grid: np.ndarray,
-    bach_vol_grid: np.ndarray,
+    bs_vol_grid: np.ndarray,    # Array of lognormal vols to sweep for the BS panel
+    bach_vol_grid: np.ndarray,  # Array of normal vols to sweep for the Bachelier panel
     save_path: str | None = None,
     show: bool = True,
 ) -> None:
-    """
-    Plot option price as a function of volatility for both the
-    Black-Scholes and Bachelier models side-by-side.
-
-    Useful for comparing how each model's price responds to changes in
-    its respective volatility parameter (lognormal vs. normal vol).
-
-    Parameters
-    ----------
-    spec          : Base OptionSpec (spot, strike, maturity, rate, type).
-                    The volatility field is overridden by the grids below.
-    bs_vol_grid   : Array of lognormal volatility values for Black-Scholes
-                    (e.g. np.linspace(0.05, 0.60, 40)).
-    bach_vol_grid : Array of normal volatility values for Bachelier
-                    (e.g. np.linspace(1.0, 30.0, 40)).
-    save_path     : Optional file path to save the figure.
-    show          : Whether to display the figure interactively.
-    """
-    # --- Compute Black-Scholes prices across the lognormal vol grid ---
+    # Price the option at every point in the Black-Scholes volatility grid.
+    # We rebuild a fresh OptionSpec for each vol level rather than mutating the original.
     bs_prices = []
     for vol in bs_vol_grid:
         updated = OptionSpec(
@@ -560,12 +341,14 @@ def plot_volatility_sensitivity(
             strike=spec.strike,
             maturity=spec.maturity,
             rate=spec.rate,
-            volatility=float(vol),    # Override only the volatility
+            volatility=float(vol),   # Cast from numpy scalar to plain float for safety
             option_type=spec.option_type,
         )
         bs_prices.append(black_scholes_price(updated))
 
-    # --- Compute Bachelier prices across the normal vol grid ---
+    # Same sweep for the Bachelier model over its own vol grid.
+    # Note: Bachelier vol is in price units (e.g. dollars), not a percentage,
+    # so the grid range is very different from the BS one.
     bach_prices = []
     for vol in bach_vol_grid:
         updated = OptionSpec(
@@ -573,19 +356,19 @@ def plot_volatility_sensitivity(
             strike=spec.strike,
             maturity=spec.maturity,
             rate=spec.rate,
-            volatility=float(vol),    # Override only the volatility
+            volatility=float(vol),
             option_type=spec.option_type,
         )
         bach_prices.append(bachelier_price(updated))
 
-    # --- Build a 1×2 figure: Black-Scholes on the left, Bachelier on the right ---
+    # Side-by-side subplots — one panel per model
     fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
 
     axes[0].plot(bs_vol_grid, bs_prices, linewidth=2, label="Black-Scholes")
     axes[0].set_title("Black-Scholes Sensitivity")
     axes[0].set_xlabel("Lognormal Volatility")
     axes[0].set_ylabel("Option Price")
-    axes[0].grid(alpha=0.3)
+    axes[0].grid(alpha=0.3)   # Faint grid lines — visible but not distracting
     axes[0].legend()
 
     axes[1].plot(bach_vol_grid, bach_prices, linewidth=2, color="orange", label="Bachelier")
@@ -595,6 +378,7 @@ def plot_volatility_sensitivity(
     axes[1].grid(alpha=0.3)
     axes[1].legend()
 
+    # Overall figure title that includes whether we're looking at calls or puts
     plt.suptitle(f"Volatility Sensitivity, {spec.option_type.capitalize()} Option")
     _finalize_plot(save_path=save_path, show=show)
 
@@ -605,21 +389,7 @@ def plot_terminal_distribution(
     save_path: str | None = None,
     show: bool = True,
 ) -> None:
-    """
-    Plot a histogram of simulated terminal asset prices under GBM.
-
-    Visualises the lognormal distribution that underpins the Black-Scholes
-    model and marks the strike price for reference, making it easy to see
-    the proportion of paths that expire in-the-money.
-
-    Parameters
-    ----------
-    spec      : OptionSpec — parameters used for the simulation.
-    n_paths   : Number of GBM paths to simulate (more → smoother histogram).
-    save_path : Optional file path to save the figure.
-    show      : Whether to display the figure interactively.
-    """
-    # Simulate terminal prices using the GBM exact solution
+    # Run a GBM simulation to get the distribution of terminal asset prices
     terminal = simulate_terminal_prices_gbm(
         spot=spec.spot,
         maturity=spec.maturity,
@@ -629,8 +399,12 @@ def plot_terminal_distribution(
     )
 
     plt.figure(figsize=(8, 5))
-    plt.hist(terminal, bins=60, alpha=0.8, edgecolor="black")   # 60 bins for smooth resolution
-    plt.axvline(spec.strike, color="red", linestyle="--", label="Strike")  # Mark the strike
+    # 60 bins gives enough resolution to see the lognormal shape clearly
+    plt.hist(terminal, bins=60, alpha=0.8, edgecolor="black")
+
+    # Vertical dashed line at the strike — makes it visually obvious how much of
+    # the distribution sits in-the-money vs out-of-the-money
+    plt.axvline(spec.strike, color="red", linestyle="--", label="Strike")
     plt.xlabel("Terminal Price")
     plt.ylabel("Frequency")
     plt.title("Simulated Terminal Price Distribution")
@@ -639,35 +413,33 @@ def plot_terminal_distribution(
     _finalize_plot(save_path=save_path, show=show)
 
 
-# ---------------------------------------------------------------------------
-# Quick self-test / usage example
-# ---------------------------------------------------------------------------
+# --- Quick Smoke Test ---
+# This block only runs when the file is executed directly (python options_pricing_toolkit.py),
+# not when it is imported as a module by another script.
 
 if __name__ == "__main__":
-    # Define a standard at-the-money (ATM) European call option:
-    #   S = K = 100, T = 1 year, r = 5%, σ = 20%
     spec = OptionSpec(
         spot=100.0,
         strike=100.0,
-        maturity=1.0,
-        rate=0.05,
-        volatility=0.2,
+        maturity=1.0,    # 1 year to expiry
+        rate=0.05,       # 5% risk-free rate
+        volatility=0.2,  # 20% annualised vol — a typical equity assumption
         option_type="call",
     )
 
-    # --- Analytical prices ---
     print("Black-Scholes:", round(black_scholes_price(spec), 4))
-    print("Bachelier:",     round(bachelier_price(spec),     4))
+    print("Bachelier:", round(bachelier_price(spec), 4))
 
-    # --- Monte Carlo price with 100k paths and a fixed seed ---
+    # monte_carlo_price returns a (price, standard_error) tuple, so we unpack both
     mc_price, mc_err = monte_carlo_price(spec, n_paths=100_000, seed=7)
     print("Monte Carlo:", round(mc_price, 4), "+/-", round(mc_err, 4))
 
-    # --- Finite-difference Greeks ---
+    # Print each Greek on its own line
     greeks = compute_greeks(spec)
     for name, value in greeks.items():
         print(name, round(value, 4))
 
-    # --- Round-trip implied vol: should recover 0.20 exactly ---
+    # Round-trip check: feed the BS price back in and recover the original vol.
+    # If implied_volatility_from_price is working correctly, this should print ~0.2.
     implied = implied_volatility_from_price(black_scholes_price(spec), spec)
     print("Implied vol:", round(implied, 4))
