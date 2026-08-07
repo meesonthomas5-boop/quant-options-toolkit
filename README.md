@@ -110,19 +110,7 @@ Because of this, the same numerical volatility input does not correspond to the 
 
 ## Limitations
 
-- European options only
 - No dividends or carry adjustments
 - No calibration framework
 - Monte Carlo uses plain sampling, without variance reduction
 - Greeks are numerical rather than analytic
-- No historical market data or backtesting component
-
-## Possible extensions
-
-- Closed-form Black-Scholes Greeks
-- Binomial tree pricing
-- Barrier and Asian options
-- Variance reduction for Monte Carlo
-- Delta hedging PnL simulation
-- Local volatility or stochastic volatility models
-- A simple backtesting or signal-research module
