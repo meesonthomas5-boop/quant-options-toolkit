@@ -111,7 +111,7 @@ def bachelier_price(spec: OptionSpec) -> float:
     K = spec.strike
     T = spec.maturity
     r = spec.rate
-    sigma = spec.volatility
+    sigma = spec.volatility * S
 
     # Same expiry edge case as Black-Scholes — return intrinsic value immediately.
     if T == 0:
