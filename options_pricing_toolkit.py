@@ -8,9 +8,10 @@ from typing import Callable          # Used to type-hint functions passed as arg
 
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 
 
-# --- Probability Helpers ---
+#     Probability Helpers
 # These two functions implement the standard normal PDF and CDF manually.
 # The Black-Scholes and Bachelier formulas both require evaluating these,
 # so rather than pulling in scipy we define them using Python's built-in math module.
@@ -28,12 +29,10 @@ def normal_cdf(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 
-# --- Option Specification ---
+#     Option Specification
 
 @dataclass
 class OptionSpec:
-    # A dataclass is essentially a struct — Python auto-generates __init__, __repr__,
-    # and __eq__ for us based on the fields declared below.
     spot: float        # Current price of the underlying asset (S)
     strike: float      # The price at which the option can be exercised (K)
     maturity: float    # Time to expiry in years (T)
@@ -57,7 +56,7 @@ class OptionSpec:
             raise ValueError("option_type must be 'call' or 'put'")
 
 
-# --- Black-Scholes Pricer ---
+#     Black-Scholes Pricer
 
 def black_scholes_price(spec: OptionSpec) -> float:
     spec.validate()
@@ -69,20 +68,15 @@ def black_scholes_price(spec: OptionSpec) -> float:
     r = spec.rate
     sigma = spec.volatility
 
-    # At expiry the option is worth exactly its intrinsic value — no time value remains.
-    # Handling this edge case avoids a division-by-zero in the d1/d2 calculation below.
+    # At expiry the option is worth its intrinsic value — no time value remains.
+    # Handling this avoids a division-by-zero in the d1/d2 calculation below.
     if T == 0:
-        if spec.option_type == "call":
-            return max(S - K, 0.0)
-        return max(K - S, 0.0)
+        return max(S - K, 0.0) if spec.option_type == "call" else max(K - S, 0.0)
 
-    # With zero volatility the asset price is deterministic, so we only need to check
-    # whether the discounted forward price beats the strike — no optionality premium.
+    # With zero vol the asset is deterministic; only check the discounted forward.
     if sigma == 0:
-        forward_intrinsic = S - K * math.exp(-r * T)
-        if spec.option_type == "call":
-            return max(forward_intrinsic, 0.0)
-        return max(-forward_intrinsic, 0.0)
+        fwd = S - K * math.exp(-r * T)
+        return max(fwd, 0.0) if spec.option_type == "call" else max(-fwd, 0.0)
 
     # Core Black-Scholes d1 and d2 terms.
     # d1 captures how far in-the-money the option is, adjusted for drift and vol.
@@ -99,7 +93,8 @@ def black_scholes_price(spec: OptionSpec) -> float:
     return K * math.exp(-r * T) * normal_cdf(-d2) - S * normal_cdf(-d1)
 
 
-# --- Bachelier Pricer ---
+#     Bachelier Pricer
+
 # The Bachelier model assumes the underlying follows arithmetic (normal) Brownian motion
 # rather than geometric Brownian motion. This means prices can go negative, which makes
 # it more appropriate for interest rates or spreads than for equity prices.
@@ -115,9 +110,7 @@ def bachelier_price(spec: OptionSpec) -> float:
 
     # Same expiry edge case as Black-Scholes — return intrinsic value immediately.
     if T == 0:
-        if spec.option_type == "call":
-            return max(S - K, 0.0)
-        return max(K - S, 0.0)
+        return max(S - K, 0.0) if spec.option_type == "call" else max(K - S, 0.0)
 
     discount = math.exp(-r * T)          # Present-value factor e^(−rT)
     forward = S * math.exp(r * T)        # Risk-neutral forward price F = S·e^(rT)
@@ -144,7 +137,7 @@ def bachelier_price(spec: OptionSpec) -> float:
     return call - discount * (forward - K)
 
 
-# --- Monte Carlo Engine ---
+#     Monte Carlo Engine
 
 def simulate_terminal_prices_gbm(
     spot: float,
@@ -216,7 +209,7 @@ def monte_carlo_price(
     return price, stderr
 
 
-# --- Numerical Greeks via Finite Differences ---
+#     Numerical Greeks via Finite Differences
 
 def finite_difference_greek(
     pricer: Callable[[OptionSpec], float],  # Any pricing function that accepts an OptionSpec
@@ -262,7 +255,7 @@ def compute_greeks(spec: OptionSpec) -> dict[str, float]:
     }
 
 
-# --- Implied Volatility via Bisection ---
+#     Implied Volatility via Bisection
 
 def implied_volatility_from_price(
     market_price: float,
@@ -306,8 +299,141 @@ def implied_volatility_from_price(
     # If we exhaust all iterations without converging, return the best midpoint we have.
     return 0.5 * (low + high)
 
+#     Monte Carlo Benchmark Sweep
 
-# --- Plotting Utilities ---
+def benchmark_mc_vs_bs(
+    base_spec: OptionSpec,
+    strikes: np.ndarray,
+    n_paths: int = 500_000,       
+    seed: int | None = 42,
+    min_price_filter: float = 0.05,  # Ignore nodes where the BS price is below this
+) -> pd.DataFrame:
+    """
+    Price the option at every strike in the grid using both Black-Scholes and
+    Monte Carlo, then compute the absolute and relative pricing error between them.
+
+    min_price_filter excludes deep OTM nodes where the analytical price is so
+    small that even tiny sampling noise produces a misleadingly large relative
+    error — those nodes are not meaningful accuracy benchmarks.
+    """
+    records = []
+    for K in strikes:
+        spec = OptionSpec(
+            spot=base_spec.spot, strike=float(K),
+            maturity=base_spec.maturity, rate=base_spec.rate,
+            volatility=base_spec.volatility, option_type=base_spec.option_type,
+        )
+        bs_price        = black_scholes_price(spec)
+        mc_price, mc_se = monte_carlo_price(spec, n_paths=n_paths, seed=seed)
+
+        abs_error = abs(mc_price - bs_price)
+
+        # Only compute relative error where the BS price clears the minimum
+        # price filter. Below that threshold we record NaN so the assertion
+        # and summary statistics skip the node rather than being distorted by it.
+        if bs_price >= min_price_filter:
+            rel_error = abs_error / bs_price * 100.0
+        else:
+            rel_error = float("nan")
+
+        records.append({
+            "strike":        float(K),
+            "bs_price":      bs_price,
+            "mc_price":      mc_price,
+            "mc_stderr":     mc_se,
+            "abs_error":     abs_error,
+            "rel_error_pct": rel_error,
+        })
+
+    return pd.DataFrame(records)
+
+#     Implied Volatility Surface
+
+def compute_iv_surface(
+    base_spec: OptionSpec,
+    strikes: np.ndarray,
+    maturities: np.ndarray,
+) -> pd.DataFrame:
+    """
+    Compute the Black-Scholes implied volatility at every (strike, maturity) node.
+    The 'market price' at each node is taken from the base_spec's own BS price,
+    which means the surface will be flat at base_spec.volatility by construction.
+    In a real application you would substitute observed market prices here.
+    """
+    records = []
+    for T in maturities:
+        for K in strikes:
+            spec = OptionSpec(
+                spot=base_spec.spot, strike=float(K),
+                maturity=float(T), rate=base_spec.rate,
+                volatility=base_spec.volatility, option_type=base_spec.option_type,
+            )
+            # Use the model's own price as the "market" price.
+            # Swap this line for a real market quote to get a live surface.
+            market_price = black_scholes_price(spec)
+
+            # Very deep OTM options have near-zero prices; IV is numerically
+            # unstable there so we skip them gracefully.
+            if market_price < 1e-8:
+                iv = float("nan")
+            else:
+                iv = implied_volatility_from_price(market_price, spec)
+
+            records.append({
+                "strike":   float(K),
+                "maturity": float(T),
+                "iv":       iv,
+            })
+
+    return pd.DataFrame(records)
+
+#     Mispricing Detector
+
+def detect_mispricing(
+    iv_surface: pd.DataFrame,
+    base_iv: float,
+    threshold_pct: float = 5.0,
+) -> pd.DataFrame:
+    """
+    Flag nodes on the IV surface where the implied vol deviates from the base
+    (flat) vol by more than threshold_pct percentage points.
+
+    In a live context, base_iv would be your model's fair-value vol estimate
+    and iv_surface would be built from real market quotes — any flagged node
+    represents a potential mispricing opportunity.
+    """
+    df = iv_surface.copy()
+
+    # Deviation in percentage-point terms, e.g. 0.25 vs 0.20 → 5 pp
+    df["iv_deviation_pct"] = (df["iv"] - base_iv) / base_iv * 100.0
+    df["mispriced"]        = df["iv_deviation_pct"].abs() > threshold_pct
+
+    return df
+
+#     Greek Profile Sweep
+
+def compute_greek_profiles(
+    base_spec: OptionSpec,
+    strikes: np.ndarray,
+) -> pd.DataFrame:
+    """
+    Compute the full Greek profile (delta, vega, rho, theta) at every strike
+    in the grid. Returns a DataFrame with one row per strike so results can be
+    exported to CSV or fed into downstream analysis.
+    """
+    records = []
+    for K in strikes:
+        spec = OptionSpec(
+            spot=base_spec.spot, strike=float(K),
+            maturity=base_spec.maturity, rate=base_spec.rate,
+            volatility=base_spec.volatility, option_type=base_spec.option_type,
+        )
+        greeks = compute_greeks(spec)
+        records.append({"strike": float(K), **greeks})
+
+    return pd.DataFrame(records)
+
+#     Plotting Utilities
 
 def _finalize_plot(save_path: str | None = None, show: bool = True) -> None:
     # Tighten subplot spacing so labels and titles don't overlap
@@ -412,8 +538,110 @@ def plot_terminal_distribution(
     plt.grid(alpha=0.3)
     _finalize_plot(save_path=save_path, show=show)
 
+def plot_mc_benchmark(
+    benchmark_df: pd.DataFrame,
+    save_path: str | None = None,
+    show: bool = True,
+) -> None:
+    """
+    Two-panel figure:
+      Left  — BS and MC prices side by side across the strike grid.
+      Right — Relative pricing error (%) with a 0.5% threshold line so it is
+              immediately obvious whether the MC engine meets the accuracy target.
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
 
-# --- Quick Smoke Test ---
+    # Left panel: price comparison
+    axes[0].plot(benchmark_df["strike"], benchmark_df["bs_price"],
+                 label="Black-Scholes", linewidth=2)
+    axes[0].plot(benchmark_df["strike"], benchmark_df["mc_price"],
+                 label="Monte Carlo", linewidth=2, linestyle="--")
+    axes[0].set_title("BS vs Monte Carlo Prices")
+    axes[0].set_xlabel("Strike")
+    axes[0].set_ylabel("Option Price")
+    axes[0].legend()
+    axes[0].grid(alpha=0.3)
+
+    # Right panel: relative error with the 0.5% target line
+    axes[1].plot(benchmark_df["strike"], benchmark_df["rel_error_pct"],
+                 color="crimson", linewidth=2, label="Relative Error %")
+    # Horizontal dashed line marks the 0.5% accuracy threshold
+    axes[1].axhline(0.5, color="black", linestyle="--", linewidth=1, label="0.5% threshold")
+    axes[1].set_title("MC vs BS Relative Pricing Error")
+    axes[1].set_xlabel("Strike")
+    axes[1].set_ylabel("Relative Error (%)")
+    axes[1].legend()
+    axes[1].grid(alpha=0.3)
+
+    plt.suptitle("Monte Carlo Benchmark vs Black-Scholes Analytical")
+    _finalize_plot(save_path=save_path, show=show)
+
+def plot_iv_surface(
+    iv_surface: pd.DataFrame,
+    mispricing_df: pd.DataFrame | None = None,
+    save_path: str | None = None,
+    show: bool = True,
+) -> None:
+    """
+    Filled-contour plot of the IV surface over the strike × maturity grid.
+    If a mispricing DataFrame is provided, flagged nodes are overlaid as red
+    scatter points so mispricing regimes are immediately visible.
+    """
+    # Pivot the tidy DataFrame into a 2D grid for contourf.
+    pivot   = iv_surface.pivot(index="maturity", columns="strike", values="iv")
+    strikes = pivot.columns.values
+    mats    = pivot.index.values
+    Z       = pivot.values
+
+    plt.figure(figsize=(9, 6))
+    cf = plt.contourf(strikes, mats, Z, levels=20, cmap="RdYlGn")
+    plt.colorbar(cf, label="Implied Volatility")
+
+    # Overlay mispriced nodes if the caller passed a mispricing DataFrame.
+    if mispricing_df is not None:
+        flagged = mispricing_df[mispricing_df["mispriced"]]
+        if not flagged.empty:
+            plt.scatter(
+                flagged["strike"], flagged["maturity"],
+                color="red", s=40, zorder=5, label="Mispriced nodes",
+            )
+            plt.legend()
+
+    plt.xlabel("Strike")
+    plt.ylabel("Maturity (years)")
+    plt.title("Implied Volatility Surface")
+    _finalize_plot(save_path=save_path, show=show)
+
+def plot_greek_profiles(
+    greek_df: pd.DataFrame,
+    save_path: str | None = None,
+    show: bool = True,
+) -> None:
+    """
+    Four-panel figure showing how each Greek evolves across the strike grid.
+    Viewing all four together makes it easy to spot where the option's risk
+    profile changes most rapidly — analogous to a sensitivity report in a
+    trading system.
+    """
+    greeks = ["delta", "vega", "rho", "theta"]
+    colors = ["steelblue", "darkorange", "seagreen", "crimson"]
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    axes = axes.flatten()  # Flatten the 2×2 grid so we can index it linearly
+
+    for ax, greek, color in zip(axes, greeks, colors):
+        ax.plot(greek_df["strike"], greek_df[greek], color=color, linewidth=2)
+        ax.set_title(greek.capitalize())
+        ax.set_xlabel("Strike")
+        ax.set_ylabel(greek.capitalize())
+        ax.axhline(0, color="black", linewidth=0.8, linestyle="--")  # Zero reference line
+        ax.grid(alpha=0.3)
+
+    plt.suptitle("Greek Profiles Across Strike Grid", fontsize=13)
+    _finalize_plot(save_path=save_path, show=show)
+    
+#     Quick Smoke Test
+
 # This block only runs when the file is executed directly (python options_pricing_toolkit.py),
 # not when it is imported as a module by another script.
 
